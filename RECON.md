@@ -11,7 +11,7 @@ Why you're doing this by hand: SellToner's pricing is behind your Google login. 
 3. F12 → Console tab.
 4. If Chrome asks you to type `allow pasting`, do that once.
 
-## Script A — answers Q1 (client-side or POST?) and Q3 (auth token)
+## Script A — answers Q2 (client-side or POST?) and Q3 (auth token)
 
 Paste, hit enter, wait ~15 seconds for `=== REPORT ===`.
 
@@ -87,8 +87,14 @@ Paste, hit enter, wait ~15 seconds for `=== REPORT ===`.
       scope.itemToAdd = scope.itemToAdd || {};
       scope.itemToAdd.item = item;
       scope.itemToAdd.vendorOfferItem = { boxStyle: 'New Box', boxCondition: 'Pristine', qty: 1 };
-      scope.easyAdd();
+      // AngularJS: $http promise callbacks only flush inside a digest, and the
+      // console runs outside one. Without $apply the XHR still fires, but the
+      // .then() that populates vendorOfferItemFactories may never run — which
+      // would look like "easyAdd failed" when the network call actually worked.
+      try { scope.$apply(() => scope.easyAdd()); }
+      catch (e) { R.notes.push('$apply threw, calling raw: ' + e); scope.easyAdd(); }
       await new Promise(res => setTimeout(res, 6000));
+      try { if (!scope.$$phase) scope.$digest(); } catch (e) {}
       const f = scope.vendorOfferItemFactories || [];
       R.easyAddPrice = f.length ? f[f.length - 1].vendorOfferItem.price : null;
       R.easyAddItemCount = f.length;
@@ -114,7 +120,7 @@ Paste, hit enter, wait ~15 seconds for `=== REPORT ===`.
     R.storage[store] = {};
     try {
       for (let i = 0; i < window[store].length; i++) {
-        const k = window[store].key(i), v = window[store].getItem(i) ?? window[store].getItem(k);
+        const k = window[store].key(i), v = window[store].getItem(k);
         const jwt = decodeJwt(v);
         R.storage[store][k] = jwt
           ? { LOOKS_LIKE_JWT: true, ...jwt }
@@ -124,6 +130,12 @@ Paste, hit enter, wait ~15 seconds for `=== REPORT ===`.
   }
   R.cookies = document.cookie || '(none readable — likely httpOnly, which is fine/good)';
 
+  // ---- un-instrument, so the page is left as we found it ----
+  window.fetch = origFetch;
+  XMLHttpRequest.prototype.open = oOpen;
+  XMLHttpRequest.prototype.send = oSend;
+  XMLHttpRequest.prototype.setRequestHeader = oSetH;
+
   console.log('=== REPORT ===');
   console.log(JSON.stringify(R, null, 2));
   try { copy(JSON.stringify(R, null, 2)); console.log('(copied to clipboard)'); } catch (e) {}
@@ -132,21 +144,28 @@ Paste, hit enter, wait ~15 seconds for `=== REPORT ===`.
 
 Then: the report is on your clipboard. Paste it to me.
 
+Reading `netDuringEasyAdd`, judge by **URL**, not by whether the array is non-empty. It captures a 6-second window, so any unrelated request the app happens to finish in that window (a poll, a lazy-loaded lookup) lands in it too. What matters is whether one of the entries is a write to an offer/item route.
+
 ### Reading it yourself, if you want
 
 | What you see in `netDuringEasyAdd` | Means | Consequence |
 | --- | --- | --- |
-| Empty array | `easyAdd()` computed the price client-side | Best case. One cheap GET per SKU, no server writes, Q2 is moot, traffic halves |
+| Empty array | `easyAdd()` computed the price client-side | Best case. One cheap GET per SKU, no server writes, Q1 is moot, traffic halves |
 | A POST | Price comes from the server | That endpoint + body is your direct API call. Now run Script B |
 | A GET only | Server prices but doesn't persist | Also fine — safe to call repeatedly |
 
 In `easyAddLastItem`, an `id` / `_id` / `vendorOfferItemId` field with a real value is a strong hint the row was persisted server-side. Script B confirms it properly.
 
-## Script B — answers Q2 (does it create server-side records?)
+## Script B — answers Q1 (does it create server-side records?)
 
 Only run this if Script A showed a POST. This is the question that can invalidate the whole plan, so it's worth doing properly.
 
-The definitive test is whether the item survives a reload — client-side state doesn't, database rows do.
+**Do this first, it is the ground truth:** open the Offers section of your SellToner account and look for stray draft offers from past scraper runs. A pile of them answers Q1 outright (and means you have cleanup to do). An empty list is good evidence but not proof — drafts may be pruned, or scoped somewhere you can't see.
+
+Then the reload test. The logic is that client-side state doesn't survive a reload but database rows do — **but read the result asymmetrically:**
+
+- `⚠️ PERSISTED` is conclusive. Only a server round-trip could refill that array after a reload.
+- `✅ NOT persisted` is *suggestive, not conclusive*. If `#/vendor-offer/create` starts a fresh blank offer on every visit rather than resuming your draft, the array is empty whether or not a row was written. Corroborate with the Offers list above and with whether `easyAddLastItem` carried a server-assigned id.
 
 1. After Script A, note `easyAddItemCount` from the report.
 2. Hard reload the page (Cmd+Shift+R).
@@ -172,7 +191,7 @@ If it says PERSISTED — that's the finding that changes everything. 7 sweeps/da
 2. Find and call a delete/reset endpoint after each batch (watch the network tab while you clear an offer manually).
 3. Drop to the nightly sweep only and accept 24h staleness — which would mean your 4-hour SLA isn't achievable through this path at all.
 
-Also check the Offers section of your SellToner account right now for stray draft offers from past scraper runs. If there's a pile of them, you have your answer already, and some cleanup to do.
+One housekeeping note: if `easyAdd` does persist, Script A left exactly one junk row (CE255X). Negligible, but delete it while you're in the Offers screen.
 
 ## Script C — answers Q4 (cheap change signal)
 
